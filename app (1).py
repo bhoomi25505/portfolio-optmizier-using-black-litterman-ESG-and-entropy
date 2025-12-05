@@ -5,6 +5,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
+from scipy.stats import norm
 import time
 
 # --- Setup and Constants ---
@@ -135,6 +136,25 @@ def calculate_portfolio_metrics(weights, log_returns, annual_trading_days=252):
     
     return portfolio_return, portfolio_volatility, sharpe_ratio
 
+def calculate_risk_metrics(log_returns, weights, confidence_level=0.95, annual_trading_days=252):
+    """Calculates Value at Risk (VaR) and Conditional Value at Risk (CVaR)."""
+    
+    # Annualize mean and std dev for the portfolio
+    port_mean = np.sum(log_returns.mean() * weights) * annual_trading_days
+    cov_matrix = log_returns.cov() * annual_trading_days
+    port_stdev = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+
+    # 1. Parametric VaR (assuming normal distribution)
+    # VaR = mean - (stdev * inverse cumulative distribution function at (1 - confidence_level))
+    VaR_percent = norm.ppf(1 - confidence_level, port_mean, port_stdev)
+    
+    # 2. Parametric CVaR (Expected Shortfall) - simplified formula for normal distribution
+    # This is an approximation. CVaR is the expected loss given that the loss is greater than VaR.
+    alpha = 1 - confidence_level
+    CVaR_percent = alpha**-1 * norm.pdf(norm.ppf(alpha)) * port_stdev - port_mean
+
+    return abs(VaR_percent), abs(CVaR_percent)
+
 
 @st.cache_data(show_spinner="Running Monte Carlo Simulation (10,000 runs)...")
 def monte_carlo_optimization(stock_data, num_portfolios=10000):
@@ -187,10 +207,17 @@ def monte_carlo_optimization(stock_data, num_portfolios=10000):
     def extract_optimal_portfolio(idx):
         """Helper to format the optimal portfolio results."""
         weights_series = results_frame.iloc[idx][[col for col in results_frame.columns if 'Weight' in col]]
+        weights_array = weights_series.values
+        
+        # Calculate advanced risk metrics for the optimal portfolio
+        VaR, CVaR = calculate_risk_metrics(log_returns, weights_array)
+
         metrics = {
             'Return': results_frame.loc[idx, 'Return'],
             'Volatility': results_frame.loc[idx, 'Volatility'],
             'Sharpe Ratio': results_frame.loc[idx, 'Sharpe Ratio'],
+            'VaR (95%)': VaR,
+            'CVaR (95%)': CVaR,
             'Weights': pd.DataFrame({
                 'Asset': weights_series.index.str.replace(' Weight', ''),
                 'Allocation (%)': (weights_series.values * 100).round(2)
@@ -208,12 +235,11 @@ def monte_carlo_optimization(stock_data, num_portfolios=10000):
 
 def page_fundamental_analysis():
     """Displays the Fundamental Analysis page."""
-    st.title("🔬 Fundamental Stock Analysis")
-    st.write("View fundamental metrics and price charts for any stock in the universe.")
+    st.title("🔬 Stock Deep Dive")
+    st.markdown("### Fundamental Metrics & Price Action")
     
     col1, col2 = st.columns([3, 1])
     
-    # Use the full universe for the search dropdown
     search_options = TICKER_UNIVERSE
     
     selected_ticker = col1.selectbox(
@@ -223,37 +249,35 @@ def page_fundamental_analysis():
         key=f'{appId}_ticker_select'
     )
     
-    if selected_ticker and col2.button("Analyze Stock"):
+    if selected_ticker and col2.button("Analyze Stock", key='analyze_btn'):
         with st.spinner(f"Fetching data for {selected_ticker}..."):
             fundamentals, prices = fetch_fundamentals(selected_ticker)
             
-            # Check if we have valid fundamentals and either it's a mock ticker or we got prices
             is_valid_data = fundamentals and (selected_ticker.startswith('MOCK') or (prices is not None and not prices.empty))
 
             if is_valid_data:
                 
-                st.subheader(f"{fundamentals.get('longName', selected_ticker)} ({selected_ticker})")
-                st.markdown(f"**Sector:** {fundamentals.get('sector', 'N/A')} | **Industry:** {fundamentals.get('industry', 'N/A')}")
+                st.markdown(f"## {fundamentals.get('longName', selected_ticker)} ({selected_ticker})")
                 
                 if selected_ticker.startswith('MOCK'):
                     st.warning("Note: This is simulated data for a mock ticker.")
                 
                 st.markdown("---")
                 
-                # Key Metrics Display
+                # Key Metrics Display (4 columns)
                 colA, colB, colC, colD = st.columns(4)
                 
-                colA.metric("Market Cap", format_number(fundamentals.get('marketCap'), is_currency=True, decimals=2))
-                colB.metric("P/E Ratio (TTM)", format_number(fundamentals.get('trailingPE')))
+                colA.metric("Market Cap", format_number(fundamentals.get('marketCap'), is_currency=True, decimals=2), help="The total value of all shares outstanding.")
+                colB.metric("P/E Ratio (TTM)", format_number(fundamentals.get('trailingPE')), help="Price to Earnings Ratio - shows if the stock is cheap or expensive.")
                 
                 div_yield = fundamentals.get('dividendYield')
                 div_str = f"{div_yield * 100:.2f}%" if isinstance(div_yield, (int, float)) and div_yield > 0 else '0.00%'
-                colC.metric("Div Yield", div_str)
+                colC.metric("Div Yield", div_str, help="Percentage return from dividends.")
                 
-                colD.metric("Symbol", selected_ticker)
+                colD.metric("Sector", fundamentals.get('sector', 'N/A'))
 
                 # Historical Price Chart
-                st.subheader("Historical Price (Last Year)")
+                st.subheader("Price History (Last Year)")
                 if prices is not None and not prices.empty:
                     fig = px.line(
                         prices.to_frame(name='Close'), 
@@ -261,13 +285,13 @@ def page_fundamental_analysis():
                         title=f'{selected_ticker} Adjusted Closing Price',
                         labels={'Close': 'Price (USD)', 'index': 'Date'}
                     )
-                    fig.update_layout(height=400, showlegend=False)
+                    fig.update_layout(height=450, showlegend=False, template='plotly_white')
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("Price chart is not available for this period or ticker.")
                 
                 # Business Summary
-                with st.expander("Company Business Summary"):
+                with st.expander("💼 Company Business Summary"):
                     st.write(fundamentals.get('longBusinessSummary', 'No business summary available.'))
                     
             else:
@@ -276,44 +300,49 @@ def page_fundamental_analysis():
 
 def page_portfolio_optimizer():
     """Displays the Portfolio Optimization page (Markowitz Efficient Frontier)."""
-    st.title("📈 Portfolio Optimizer (Mean-Variance)")
-    st.write("Applies Modern Portfolio Theory (MPT) using Monte Carlo simulation to optimize asset allocation based on risk and return.")
+    st.title("💰 Portfolio Optimizer")
+    st.write("Find the ideal mix of assets to balance risk and expected return using the Efficient Frontier model.")
     
 
-    # --- Setup and Input ---
+    # --- Setup and Input (Using columns for a cleaner layout) ---
     
     DEFAULT_ASSETS = ['AAPL', 'MSFT', 'JPM', 'XOM', 'GLD']
     
-    # Define the options list (only real tickers allowed for optimization)
-    available_options = [t for t in TICKER_UNIVERSE if not t.startswith('MOCK')]
-    
-    # CRITICAL FIX: Ensure default assets exist in the options list
-    default_selection = [asset for asset in DEFAULT_ASSETS if asset in available_options]
+    with st.container():
+        st.subheader("1. Select Your Assets & Timeframe")
+        
+        col_assets, col_years = st.columns([3, 1])
 
-    selected_assets = st.multiselect(
-        "Select Assets for Optimization (Min 2):",
-        options=available_options,
-        default=default_selection, # Use the checked default list
-        key=f'{appId}_assets_select'
-    )
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        years = st.slider("Historical Data Period (Years):", 1, 10, 5, key=f'{appId}_years_slider')
-    with col2:
-        num_runs = st.slider("Monte Carlo Simulations:", 1000, 20000, 10000, 1000, key=f'{appId}_runs_slider')
+        # Define the options list (only real tickers allowed for optimization)
+        available_options = [t for t in TICKER_UNIVERSE if not t.startswith('MOCK')]
+        
+        # CRITICAL FIX: Ensure default assets exist in the options list
+        default_selection = [asset for asset in DEFAULT_ASSETS if asset in available_options]
 
-    start_date = (datetime.now() - timedelta(days=int(years * 365.25))).strftime('%Y-%m-%d')
-    end_date = datetime.now().strftime('%Y-%m-%d')
+        selected_assets = col_assets.multiselect(
+            "Assets (Min 2):",
+            options=available_options,
+            default=default_selection,
+            key=f'{appId}_assets_select',
+            help="Select the stocks you want to include in your portfolio for optimization."
+        )
+        
+        with col_years:
+            years = st.slider("Historical Data (Years):", 1, 10, 5, key=f'{appId}_years_slider', help="Longer periods give more data but may include outdated market conditions.")
 
-    st.info(f"Optimization will use historical data from **{start_date}** to **{end_date}**.")
+        num_runs = st.slider("Monte Carlo Simulations:", 1000, 20000, 10000, 1000, key=f'{appId}_runs_slider', help="More runs increase accuracy but take slightly longer.")
+
+        start_date = (datetime.now() - timedelta(days=int(years * 365.25))).strftime('%Y-%m-%d')
+        end_date = datetime.now().strftime('%Y-%m-%d')
+
+        st.caption(f"Data period: {start_date} to {end_date}")
     
     st.markdown("---")
 
     # --- Optimization Logic ---
-    if st.button("Run Portfolio Optimization", use_container_width=True):
+    if st.button("🚀 Run Optimization", use_container_width=True, key='run_opt_btn'):
         if len(selected_assets) < 2:
-            st.warning("Please select at least two assets to perform portfolio optimization.")
+            st.error("Please select at least two assets to perform portfolio optimization.")
             return
 
         # 1. Fetch data
@@ -324,12 +353,13 @@ def page_portfolio_optimizer():
             return
 
         # 2. Run optimization
-        results_frame, max_sharpe, min_vol = monte_carlo_optimization(stock_data, num_runs)
+        with st.spinner(f"Running {num_runs} Monte Carlo simulations..."):
+            results_frame, max_sharpe, min_vol = monte_carlo_optimization(stock_data, num_runs)
 
-        # 3. Output and Visualization
+        st.success(f"Simulation Complete! {num_runs} portfolios analyzed.")
         
-        st.subheader("Efficient Frontier Analysis")
-        st.success(f"Simulation Complete: Analyzed {num_runs} portfolios over {years} years.")
+        st.subheader("2. Efficient Frontier & Optimal Portfolios")
+        st.info("The Efficient Frontier shows the best possible trade-off between risk (Volatility) and reward (Return).")
         
         # Efficient Frontier Plot 
         fig = px.scatter(
@@ -338,7 +368,7 @@ def page_portfolio_optimizer():
             y='Return',
             color='Sharpe Ratio',
             color_continuous_scale=px.colors.sequential.Viridis,
-            title='Markowitz Efficient Frontier (Monte Carlo Simulation)',
+            title='Markowitz Efficient Frontier',
             labels={'Volatility': 'Annualized Volatility (Risk)', 'Return': 'Annualized Return'}
         )
         
@@ -347,7 +377,7 @@ def page_portfolio_optimizer():
             x=[max_sharpe['Volatility']],
             y=[max_sharpe['Return']],
             mode='markers',
-            marker=dict(color='red', size=15, symbol='star', line=dict(width=1, color='black')),
+            marker=dict(color='red', size=18, symbol='star', line=dict(width=2, color='white')),
             name=f'Max Sharpe Ratio ({max_sharpe["Sharpe Ratio"]:.2f})'
         ))
 
@@ -355,39 +385,58 @@ def page_portfolio_optimizer():
             x=[min_vol['Volatility']],
             y=[min_vol['Return']],
             mode='markers',
-            marker=dict(color='blue', size=15, symbol='circle', line=dict(width=1, color='black')),
-            name=f'Min Volatility ({min_vol["Volatility"]:.2f})'
+            marker=dict(color='blue', size=18, symbol='circle', line=dict(width=2, color='white')),
+            name=f'Min Volatility ({min_vol["Volatility"] * 100:.2f}%)'
         ))
 
-        fig.update_layout(height=550)
+        fig.update_layout(height=600, template='plotly_white')
         st.plotly_chart(fig, use_container_width=True)
 
-
         # 4. Optimal Portfolio Results
-        st.subheader("Optimal Portfolio Allocations")
-        st.markdown("The following allocations represent the historical optimal trade-offs between risk and return, based on the selected data period.")
+        st.subheader("3. Optimal Allocation & Risk Breakdown")
         
         col_max, col_min = st.columns(2)
         
         # Max Sharpe Portfolio
         with col_max:
-            st.markdown(f"**🔴 Max Sharpe Ratio Portfolio**")
-            st.metric("Sharpe Ratio", f"{max_sharpe['Sharpe Ratio']:.2f}")
-            st.metric("Expected Return (Annual)", f"{max_sharpe['Return'] * 100:.2f}%")
-            st.metric("Expected Volatility (Annual)", f"{max_sharpe['Volatility'] * 100:.2f}%")
+            st.markdown(f"### 🎯 Max Sharpe Portfolio (Best Risk-Adjusted)")
+            st.markdown(f"**Sharpe Ratio:** `{max_sharpe['Sharpe Ratio']:.2f}` (Highest return per unit of risk)")
             
             st.dataframe(max_sharpe['Weights'], use_container_width=True)
 
-
         # Min Volatility Portfolio
         with col_min:
-            st.markdown(f"**🔵 Minimum Volatility Portfolio**")
-            st.metric("Sharpe Ratio", f"{min_vol['Sharpe Ratio']:.2f}")
-            st.metric("Expected Return (Annual)", f"{min_vol['Return'] * 100:.2f}%")
-            st.metric("Expected Volatility (Annual)", f"{min_vol['Volatility'] * 100:.2f}%")
-            
+            st.markdown(f"### 🛡️ Min Volatility Portfolio (Lowest Risk)")
+            st.markdown(f"**Sharpe Ratio:** `{min_vol['Sharpe Ratio']:.2f}`")
+
             st.dataframe(min_vol['Weights'], use_container_width=True)
+            
+        st.markdown("---")
         
+        # --- NEW: Advanced Risk Metrics ---
+        st.subheader("4. Advanced Risk Analysis (95% Confidence)")
+        st.warning("These metrics estimate potential losses under adverse market conditions.")
+        
+        col_risk_1, col_risk_2 = st.columns(2)
+        
+        with col_risk_1:
+            st.markdown("#### Max Sharpe Risk")
+            st.metric(
+                "Annual VaR (Value at Risk)", 
+                f"{max_sharpe['VaR (95%)'] * 100:.2f}%", 
+                help="Maximum expected loss over one year 95% of the time."
+            )
+            st.metric(
+                "Annual CVaR (Conditional VaR)", 
+                f"{max_sharpe['CVaR (95%)'] * 100:.2f}%", 
+                help="Expected loss given that the VaR has been exceeded (the average of the worst 5% of outcomes)."
+            )
+            
+        with col_risk_2:
+            st.markdown("#### Min Volatility Risk")
+            st.metric("Annual VaR (Value at Risk)", f"{min_vol['VaR (95%)'] * 100:.2f}%")
+            st.metric("Annual CVaR (Conditional VaR)", f"{min_vol['CVaR (95%)'] * 100:.2f}%")
+
 
 # --- Main App Execution ---
 def main():
@@ -397,31 +446,44 @@ def main():
         initial_sidebar_state="expanded"
     )
 
-    # Global Style: Custom CSS for aesthetics
+    # Global Style: Custom CSS for aesthetics and engaging UX
     st.markdown("""
         <style>
         /* General page layout improvements */
         .css-1d391kg { padding-top: 35px; } 
         
+        /* Custom Font for Header */
+        h1 { color: #007BFF; text-shadow: 1px 1px 2px #d0d0d0; }
+        h3 { color: #0056b3; }
+        
         /* Button styling for better UX */
         .stButton>button {
-            background-color: #007BFF;
+            background-color: #4CAF50; /* Green for GO button */
             color: white;
-            border-radius: 8px;
+            border-radius: 12px;
             font-weight: bold;
+            font-size: 1.1rem;
+            padding: 10px 20px;
             transition: all 0.2s;
-            border: 1px solid #007BFF;
+            border: none;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
         .stButton>button:hover {
-            background-color: #0056b3;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            background-color: #45a049;
+            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.2);
         }
         /* Metric card styling */
         [data-testid="stMetric"] {
+            background-color: #f7f9fc;
             border: 1px solid #e0e0e0;
             border-radius: 8px;
-            padding: 10px;
+            padding: 15px;
             box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.05);
+        }
+        /* Make multiselect input look cleaner and slightly raised */
+        [data-testid="stMultiSelect"] > div {
+            border-radius: 8px;
+            box-shadow: 1px 1px 3px rgba(0, 0, 0, 0.05);
         }
         </style>
     """, unsafe_allow_html=True)
