@@ -149,8 +149,9 @@ def calculate_risk_metrics(log_returns, weights, confidence_level=0.95, annual_t
     VaR_percent = norm.ppf(1 - confidence_level, port_mean, port_stdev)
     
     # 2. Parametric CVaR (Expected Shortfall) - simplified formula for normal distribution
-    # This is an approximation. CVaR is the expected loss given that the loss is greater than VaR.
+    # CVaR is the expected loss given that the loss is greater than VaR.
     alpha = 1 - confidence_level
+    # Note: For CVaR of a normal distribution, the formula is (pdf(norm.ppf(alpha)) / alpha) * stdev - mean
     CVaR_percent = alpha**-1 * norm.pdf(norm.ppf(alpha)) * port_stdev - port_mean
 
     return abs(VaR_percent), abs(CVaR_percent)
@@ -231,6 +232,51 @@ def monte_carlo_optimization(stock_data, num_portfolios=10000):
     return results_frame, max_sharpe_portfolio, min_vol_portfolio
 
 
+def find_custom_portfolio(results_frame, target_return, target_volatility):
+    """
+    Finds the simulated portfolio closest to the user's defined targets.
+    This uses the Euclidean distance to find the closest point on the risk-return plane.
+    """
+    # Normalize inputs to prevent distance domination by one metric
+    results_frame['Norm_Return'] = results_frame['Return']
+    results_frame['Norm_Volatility'] = results_frame['Volatility']
+    
+    # Calculate the distance from the target point (Target Volatility, Target Return)
+    results_frame['Distance'] = np.sqrt(
+        (results_frame['Norm_Volatility'] - target_volatility)**2 + 
+        (results_frame['Norm_Return'] - target_return)**2
+    )
+    
+    # Find the index of the minimum distance
+    closest_idx = results_frame['Distance'].idxmin()
+
+    # Extract metrics for the closest portfolio
+    weights_series = results_frame.iloc[closest_idx][[col for col in results_frame.columns if 'Weight' in col]]
+    weights_array = weights_series.values
+    
+    # Need to re-calculate log returns to pass to calculate_risk_metrics
+    selected_tickers = [col.replace(' Weight', '') for col in weights_series.index]
+    
+    # Fetch data again (will use cached data) just to ensure we have the returns object structure
+    stock_data = fetch_price_data(selected_tickers, st.session_state[f'{appId}_start_date'], st.session_state[f'{appId}_end_date'])
+    log_returns = np.log(stock_data / stock_data.shift(1)).dropna()
+
+    VaR, CVaR = calculate_risk_metrics(log_returns, weights_array)
+    
+    metrics = {
+        'Return': results_frame.loc[closest_idx, 'Return'],
+        'Volatility': results_frame.loc[closest_idx, 'Volatility'],
+        'Sharpe Ratio': results_frame.loc[closest_idx, 'Sharpe Ratio'],
+        'VaR (95%)': VaR,
+        'CVaR (95%)': CVaR,
+        'Weights': pd.DataFrame({
+            'Asset': weights_series.index.str.replace(' Weight', ''),
+            'Allocation (%)': (weights_series.values * 100).round(2)
+        }).set_index('Asset')
+    }
+    return metrics
+
+
 # --- Streamlit Application Pages ---
 
 def page_fundamental_analysis():
@@ -304,19 +350,19 @@ def page_portfolio_optimizer():
     st.write("Find the ideal mix of assets to balance risk and expected return using the Efficient Frontier model.")
     
 
-    # --- Setup and Input (Using columns for a cleaner layout) ---
+    # --- 1. Select Assets, Timeframe, and Custom Targets ---
     
     DEFAULT_ASSETS = ['AAPL', 'MSFT', 'JPM', 'XOM', 'GLD']
     
     with st.container():
-        st.subheader("1. Select Your Assets & Timeframe")
+        st.subheader("1. Setup Your Investment Strategy")
         
         col_assets, col_years = st.columns([3, 1])
 
         # Define the options list (only real tickers allowed for optimization)
         available_options = [t for t in TICKER_UNIVERSE if not t.startswith('MOCK')]
         
-        # CRITICAL FIX: Ensure default assets exist in the options list
+        # Ensure default assets exist in the options list
         default_selection = [asset for asset in DEFAULT_ASSETS if asset in available_options]
 
         selected_assets = col_assets.multiselect(
@@ -332,11 +378,38 @@ def page_portfolio_optimizer():
 
         num_runs = st.slider("Monte Carlo Simulations:", 1000, 20000, 10000, 1000, key=f'{appId}_runs_slider', help="More runs increase accuracy but take slightly longer.")
 
+        # Calculate dates and store in session state for cross-function access
         start_date = (datetime.now() - timedelta(days=int(years * 365.25))).strftime('%Y-%m-%d')
         end_date = datetime.now().strftime('%Y-%m-%d')
+        st.session_state[f'{appId}_start_date'] = start_date
+        st.session_state[f'{appId}_end_date'] = end_date
 
         st.caption(f"Data period: {start_date} to {end_date}")
+        
+    st.markdown("---")
     
+    # --- Custom Risk/Return Targets ---
+    with st.expander("🎯 Set Your Target Return and Risk Appetite (Optional)", expanded=True):
+        col_target_ret, col_target_vol = st.columns(2)
+        
+        # Max reasonable value for slider is based on historical market data (e.g., 50% max return, 40% max vol)
+        target_return = col_target_ret.slider(
+            "Target Annual Return (%)", 
+            min_value=0, max_value=50, value=15, step=1, 
+            key=f'{appId}_target_return',
+            help="Your desired yearly return from the portfolio."
+        ) / 100 # Convert to decimal
+        
+        target_volatility = col_target_vol.slider(
+            "Risk Appetite (Target Annual Volatility %)", 
+            min_value=5, max_value=40, value=20, step=1, 
+            key=f'{appId}_target_volatility',
+            help="Your maximum acceptable risk level (volatility)."
+        ) / 100 # Convert to decimal
+        
+        st.markdown(f"**Selected Target:** Return: **{target_return * 100:.1f}%** | Volatility: **{target_volatility * 100:.1f}%**")
+
+
     st.markdown("---")
 
     # --- Optimization Logic ---
@@ -356,31 +429,53 @@ def page_portfolio_optimizer():
         with st.spinner(f"Running {num_runs} Monte Carlo simulations..."):
             results_frame, max_sharpe, min_vol = monte_carlo_optimization(stock_data, num_runs)
 
-        st.success(f"Simulation Complete! {num_runs} portfolios analyzed.")
+        st.session_state[f'{appId}_results_frame'] = results_frame
+        st.session_state[f'{appId}_max_sharpe'] = max_sharpe
+        st.session_state[f'{appId}_min_vol'] = min_vol
+        st.session_state[f'{appId}_target_return'] = target_return
+        st.session_state[f'{appId}_target_volatility'] = target_volatility
+        st.session_state[f'{appId}_optimization_run'] = True
+        
+        st.rerun() # Use rerun to display results after updating session state
+
+    # --- Display Results ---
+    if f'{appId}_optimization_run' in st.session_state and st.session_state[f'{appId}_optimization_run']:
+        results_frame = st.session_state[f'{appId}_results_frame']
+        max_sharpe = st.session_state[f'{appId}_max_sharpe']
+        min_vol = st.session_state[f'{appId}_min_vol']
+        target_return = st.session_state[f'{appId}_target_return']
+        target_volatility = st.session_state[f'{appId}_target_volatility']
+        
+        # --- Find Custom Portfolio ---
+        custom_portfolio = find_custom_portfolio(results_frame.copy(), target_return, target_volatility)
+
+        st.success(f"Simulation Complete! {len(results_frame)} portfolios analyzed.")
         
         st.subheader("2. Efficient Frontier & Optimal Portfolios")
-        st.info("The Efficient Frontier shows the best possible trade-off between risk (Volatility) and reward (Return).")
+        st.info("The Efficient Frontier (green curve) shows the set of best possible portfolios. The chart below visualizes thousands of randomized portfolios.")
         
-        # Efficient Frontier Plot 
+        # Efficient Frontier Plot (Scatter Plot)
         fig = px.scatter(
             results_frame,
             x='Volatility',
             y='Return',
             color='Sharpe Ratio',
             color_continuous_scale=px.colors.sequential.Viridis,
-            title='Markowitz Efficient Frontier',
+            title='Markowitz Efficient Frontier & Portfolio Scatter',
             labels={'Volatility': 'Annualized Volatility (Risk)', 'Return': 'Annualized Return'}
         )
         
         # Add Optimal Portfolio markers
+        # Max Sharpe (Red Star)
         fig.add_trace(go.Scatter(
             x=[max_sharpe['Volatility']],
             y=[max_sharpe['Return']],
             mode='markers',
             marker=dict(color='red', size=18, symbol='star', line=dict(width=2, color='white')),
-            name=f'Max Sharpe Ratio ({max_sharpe["Sharpe Ratio"]:.2f})'
+            name=f'Max Sharpe ({max_sharpe["Sharpe Ratio"]:.2f})'
         ))
 
+        # Min Vol (Blue Circle)
         fig.add_trace(go.Scatter(
             x=[min_vol['Volatility']],
             y=[min_vol['Return']],
@@ -388,54 +483,130 @@ def page_portfolio_optimizer():
             marker=dict(color='blue', size=18, symbol='circle', line=dict(width=2, color='white')),
             name=f'Min Volatility ({min_vol["Volatility"] * 100:.2f}%)'
         ))
+        
+        # Custom Target (Orange Square)
+        fig.add_trace(go.Scatter(
+            x=[target_volatility],
+            y=[target_return],
+            mode='markers',
+            marker=dict(color='orange', size=18, symbol='square', line=dict(width=2, color='black')),
+            name=f'Your Target ({target_return * 100:.1f}%, {target_volatility * 100:.1f}%)'
+        ))
+        
+        # Custom Found Portfolio (Purple Diamond)
+        fig.add_trace(go.Scatter(
+            x=[custom_portfolio['Volatility']],
+            y=[custom_portfolio['Return']],
+            mode='markers',
+            marker=dict(color='purple', size=18, symbol='diamond', line=dict(width=2, color='white')),
+            name=f'Custom Portfolio Found'
+        ))
+
 
         fig.update_layout(height=600, template='plotly_white')
         st.plotly_chart(fig, use_container_width=True)
+        # 
 
-        # 4. Optimal Portfolio Results
+
+        # 3. Optimal Allocation & Risk Breakdown
         st.subheader("3. Optimal Allocation & Risk Breakdown")
         
-        col_max, col_min = st.columns(2)
+        tab1, tab2, tab3 = st.tabs(["🎯 Custom Portfolio", "⭐ Max Sharpe Portfolio", "🐢 Min Volatility Portfolio"])
         
-        # Max Sharpe Portfolio
-        with col_max:
-            st.markdown(f"### 🎯 Max Sharpe Portfolio (Best Risk-Adjusted)")
-            st.markdown(f"**Sharpe Ratio:** `{max_sharpe['Sharpe Ratio']:.2f}` (Highest return per unit of risk)")
+        # --- Tab 1: Custom Portfolio ---
+        with tab1:
+            st.markdown(f"### Closest to Your Target (Return: {target_return * 100:.1f}% | Vol: {target_volatility * 100:.1f}%)")
             
-            st.dataframe(max_sharpe['Weights'], use_container_width=True)
+            col_metric_A, col_metric_B, col_metric_C = st.columns(3)
+            col_metric_A.metric("Return Achieved", f"{custom_portfolio['Return'] * 100:.2f}%", help="Annualized expected return.")
+            col_metric_B.metric("Volatility Achieved", f"{custom_portfolio['Volatility'] * 100:.2f}%", help="Annualized risk level.")
+            col_metric_C.metric("Sharpe Ratio", f"{custom_portfolio['Sharpe Ratio']:.2f}", help="Risk-adjusted return (Higher is better).")
 
-        # Min Volatility Portfolio
-        with col_min:
-            st.markdown(f"### 🛡️ Min Volatility Portfolio (Lowest Risk)")
-            st.markdown(f"**Sharpe Ratio:** `{min_vol['Sharpe Ratio']:.2f}`")
+            st.markdown("#### Allocation Weights")
+            col_weights, col_chart = st.columns(2)
+            
+            with col_weights:
+                st.dataframe(custom_portfolio['Weights'], use_container_width=True)
+            
+            with col_chart:
+                fig_weights = px.pie(
+                    custom_portfolio['Weights'].reset_index(),
+                    values='Allocation (%)',
+                    names='Asset',
+                    title='Asset Distribution',
+                    color_discrete_sequence=px.colors.qualitative.T10
+                )
+                fig_weights.update_traces(textposition='inside', textinfo='percent+label')
+                fig_weights.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
+                st.plotly_chart(fig_weights, use_container_width=True)
+            
+            st.markdown("#### Risk Analysis (95% Confidence)")
+            col_var, col_cvar = st.columns(2)
+            col_var.metric("Annual VaR (Value at Risk)", f"{custom_portfolio['VaR (95%)'] * 100:.2f}%")
+            col_cvar.metric("Annual CVaR (Conditional VaR)", f"{custom_portfolio['CVaR (95%)'] * 100:.2f}%")
 
-            st.dataframe(min_vol['Weights'], use_container_width=True)
+
+        # --- Tab 2: Max Sharpe Portfolio ---
+        with tab2:
+            st.markdown("### ⭐ Max Sharpe Portfolio (Highest Risk-Adjusted Return)")
+            col_metric_A, col_metric_B, col_metric_C = st.columns(3)
+            col_metric_A.metric("Expected Return", f"{max_sharpe['Return'] * 100:.2f}%")
+            col_metric_B.metric("Volatility", f"{max_sharpe['Volatility'] * 100:.2f}%")
+            col_metric_C.metric("Sharpe Ratio", f"{max_sharpe['Sharpe Ratio']:.2f}")
+
+            st.markdown("#### Allocation Weights")
+            col_weights, col_chart = st.columns(2)
             
-        st.markdown("---")
-        
-        # --- NEW: Advanced Risk Metrics ---
-        st.subheader("4. Advanced Risk Analysis (95% Confidence)")
-        st.warning("These metrics estimate potential losses under adverse market conditions.")
-        
-        col_risk_1, col_risk_2 = st.columns(2)
-        
-        with col_risk_1:
-            st.markdown("#### Max Sharpe Risk")
-            st.metric(
-                "Annual VaR (Value at Risk)", 
-                f"{max_sharpe['VaR (95%)'] * 100:.2f}%", 
-                help="Maximum expected loss over one year 95% of the time."
-            )
-            st.metric(
-                "Annual CVaR (Conditional VaR)", 
-                f"{max_sharpe['CVaR (95%)'] * 100:.2f}%", 
-                help="Expected loss given that the VaR has been exceeded (the average of the worst 5% of outcomes)."
-            )
+            with col_weights:
+                st.dataframe(max_sharpe['Weights'], use_container_width=True)
             
-        with col_risk_2:
-            st.markdown("#### Min Volatility Risk")
-            st.metric("Annual VaR (Value at Risk)", f"{min_vol['VaR (95%)'] * 100:.2f}%")
-            st.metric("Annual CVaR (Conditional VaR)", f"{min_vol['CVaR (95%)'] * 100:.2f}%")
+            with col_chart:
+                fig_weights = px.pie(
+                    max_sharpe['Weights'].reset_index(),
+                    values='Allocation (%)',
+                    names='Asset',
+                    title='Asset Distribution',
+                    color_discrete_sequence=px.colors.qualitative.Set2
+                )
+                fig_weights.update_traces(textposition='inside', textinfo='percent+label')
+                fig_weights.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
+                st.plotly_chart(fig_weights, use_container_width=True)
+            
+            st.markdown("#### Risk Analysis (95% Confidence)")
+            col_var, col_cvar = st.columns(2)
+            col_var.metric("Annual VaR (Value at Risk)", f"{max_sharpe['VaR (95%)'] * 100:.2f}%")
+            col_cvar.metric("Annual CVaR (Conditional VaR)", f"{max_sharpe['CVaR (95%)'] * 100:.2f}%")
+        
+        # --- Tab 3: Min Volatility Portfolio ---
+        with tab3:
+            st.markdown("### 🐢 Min Volatility Portfolio (Lowest Risk)")
+            col_metric_A, col_metric_B, col_metric_C = st.columns(3)
+            col_metric_A.metric("Expected Return", f"{min_vol['Return'] * 100:.2f}%")
+            col_metric_B.metric("Volatility", f"{min_vol['Volatility'] * 100:.2f}%")
+            col_metric_C.metric("Sharpe Ratio", f"{min_vol['Sharpe Ratio']:.2f}")
+
+            st.markdown("#### Allocation Weights")
+            col_weights, col_chart = st.columns(2)
+            
+            with col_weights:
+                st.dataframe(min_vol['Weights'], use_container_width=True)
+            
+            with col_chart:
+                fig_weights = px.pie(
+                    min_vol['Weights'].reset_index(),
+                    values='Allocation (%)',
+                    names='Asset',
+                    title='Asset Distribution',
+                    color_discrete_sequence=px.colors.qualitative.Pastel
+                )
+                fig_weights.update_traces(textposition='inside', textinfo='percent+label')
+                fig_weights.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
+                st.plotly_chart(fig_weights, use_container_width=True)
+            
+            st.markdown("#### Risk Analysis (95% Confidence)")
+            col_var, col_cvar = st.columns(2)
+            col_var.metric("Annual VaR (Value at Risk)", f"{min_vol['VaR (95%)'] * 100:.2f}%")
+            col_cvar.metric("Annual CVaR (Conditional VaR)", f"{min_vol['CVaR (95%)'] * 100:.2f}%")
 
 
 # --- Main App Execution ---
