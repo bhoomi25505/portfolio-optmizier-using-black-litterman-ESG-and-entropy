@@ -11,10 +11,10 @@ import time
 
 # Define the environment variable checks for Python (safer)
 try:
-    # This block handles the dynamic app ID if available in the execution environment
+    # Attempt to use a secret if running on Streamlit Cloud or similar environments
     appId = st.secrets["APP_ID"]
-except KeyError:
-    # Fallback for local testing if the secret is not defined
+except (KeyError, AttributeError):
+    # Fallback for local testing or unknown environments
     appId = 'default-portfolio-optimizer-app'
 
 # List of 500+ representative tickers (S&P 500 subset + a mix of other caps)
@@ -67,6 +67,7 @@ def fetch_price_data(tickers, start_date, end_date):
     if not tickers:
         return pd.DataFrame()
     
+    # Filter out mock tickers before calling yfinance
     real_tickers = [t for t in tickers if not t.startswith('MOCK')]
     if not real_tickers:
         return pd.DataFrame()
@@ -98,10 +99,12 @@ def fetch_fundamentals(ticker):
             'trailingPE': np.random.uniform(15, 60),
             'dividendYield': np.random.uniform(0, 0.03),
             'longBusinessSummary': f'This is a synthetic description for {ticker}. It specializes in disruptive solutions within the {np.random.choice(["cloud computing", "AI integration", "biotech development"])} sector. Financials are simulated.',
+            'industry': 'Mock Industry'
         }, pd.DataFrame({'Close': [100 + i for i in range(252)]}) # Mock prices
     
     try:
         stock = yf.Ticker(ticker)
+        # Fetching info can sometimes fail, so wrap in try/except
         info = stock.info
         
         required_keys = ['longName', 'sector', 'marketCap', 'trailingPE', 'dividendYield', 'longBusinessSummary', 'industry']
@@ -120,22 +123,20 @@ def calculate_portfolio_metrics(weights, log_returns, annual_trading_days=252):
     """Calculates annualized return, volatility, and Sharpe Ratio."""
     
     # 1. Annualized Return (Expected Return)
-    # Sum of (weight * mean daily return) * trading days
     portfolio_return = np.sum(log_returns.mean() * weights) * annual_trading_days
     
     # 2. Annualized Volatility (Standard Deviation)
-    # Volatility = sqrt(w^T * Cov * w) * sqrt(trading days)
     cov_matrix = log_returns.cov() * annual_trading_days
     portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
     
-    # 3. Sharpe Ratio (Assuming a 2% risk-free rate, which is common for short-term T-bills)
+    # 3. Sharpe Ratio (Assumes a 2% risk-free rate)
     RISK_FREE_RATE = 0.02 
     sharpe_ratio = (portfolio_return - RISK_FREE_RATE) / portfolio_volatility
     
     return portfolio_return, portfolio_volatility, sharpe_ratio
 
 
-@st.cache_data(show_spinner="Running Monte Carlo Simulation...")
+@st.cache_data(show_spinner="Running Monte Carlo Simulation (10,000 runs)...")
 def monte_carlo_optimization(stock_data, num_portfolios=10000):
     """
     Performs Monte Carlo simulation to estimate the Efficient Frontier.
@@ -212,7 +213,7 @@ def page_fundamental_analysis():
     
     col1, col2 = st.columns([3, 1])
     
-    # Use a large subset for the search dropdown
+    # Use the full universe for the search dropdown
     search_options = TICKER_UNIVERSE
     
     selected_ticker = col1.selectbox(
@@ -226,7 +227,10 @@ def page_fundamental_analysis():
         with st.spinner(f"Fetching data for {selected_ticker}..."):
             fundamentals, prices = fetch_fundamentals(selected_ticker)
             
-            if fundamentals and (selected_ticker.startswith('MOCK') or (prices is not None and not prices.empty)):
+            # Check if we have valid fundamentals and either it's a mock ticker or we got prices
+            is_valid_data = fundamentals and (selected_ticker.startswith('MOCK') or (prices is not None and not prices.empty))
+
+            if is_valid_data:
                 
                 st.subheader(f"{fundamentals.get('longName', selected_ticker)} ({selected_ticker})")
                 st.markdown(f"**Sector:** {fundamentals.get('sector', 'N/A')} | **Industry:** {fundamentals.get('industry', 'N/A')}")
@@ -274,15 +278,22 @@ def page_portfolio_optimizer():
     """Displays the Portfolio Optimization page (Markowitz Efficient Frontier)."""
     st.title("📈 Portfolio Optimizer (Mean-Variance)")
     st.write("Applies Modern Portfolio Theory (MPT) using Monte Carlo simulation to optimize asset allocation based on risk and return.")
+    
 
     # --- Setup and Input ---
     
     DEFAULT_ASSETS = ['AAPL', 'MSFT', 'JPM', 'XOM', 'GLD']
     
+    # Define the options list (only real tickers allowed for optimization)
+    available_options = [t for t in TICKER_UNIVERSE if not t.startswith('MOCK')]
+    
+    # CRITICAL FIX: Ensure default assets exist in the options list
+    default_selection = [asset for asset in DEFAULT_ASSETS if asset in available_options]
+
     selected_assets = st.multiselect(
         "Select Assets for Optimization (Min 2):",
-        options=[t for t in TICKER_UNIVERSE if not t.startswith('MOCK')],
-        default=DEFAULT_ASSETS,
+        options=available_options,
+        default=default_selection, # Use the checked default list
         key=f'{appId}_assets_select'
     )
     
