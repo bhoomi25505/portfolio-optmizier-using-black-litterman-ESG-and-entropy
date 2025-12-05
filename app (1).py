@@ -228,11 +228,12 @@ def monte_carlo_optimization(stock_data, num_portfolios=10000):
 
     max_sharpe_portfolio = extract_optimal_portfolio(max_sharpe_idx)
     min_vol_portfolio = extract_optimal_portfolio(min_vol_idx)
+    
+    # Return log_returns as well for custom portfolio calculation later
+    return results_frame, max_sharpe_portfolio, min_vol_portfolio, log_returns
 
-    return results_frame, max_sharpe_portfolio, min_vol_portfolio
 
-
-def find_custom_portfolio(results_frame, target_return, target_volatility):
+def find_custom_portfolio(results_frame, target_return, target_volatility, log_returns):
     """
     Finds the simulated portfolio closest to the user's defined targets.
     This uses the Euclidean distance to find the closest point on the risk-return plane.
@@ -254,13 +255,7 @@ def find_custom_portfolio(results_frame, target_return, target_volatility):
     weights_series = results_frame.iloc[closest_idx][[col for col in results_frame.columns if 'Weight' in col]]
     weights_array = weights_series.values
     
-    # Need to re-calculate log returns to pass to calculate_risk_metrics
-    selected_tickers = [col.replace(' Weight', '') for col in weights_series.index]
-    
-    # Fetch data again (will use cached data) just to ensure we have the returns object structure
-    stock_data = fetch_price_data(selected_tickers, st.session_state[f'{appId}_start_date'], st.session_state[f'{appId}_end_date'])
-    log_returns = np.log(stock_data / stock_data.shift(1)).dropna()
-
+    # Calculate VaR/CVaR using the passed log_returns object
     VaR, CVaR = calculate_risk_metrics(log_returns, weights_array)
     
     metrics = {
@@ -427,9 +422,11 @@ def page_portfolio_optimizer():
 
         # 2. Run optimization
         with st.spinner(f"Running {num_runs} Monte Carlo simulations..."):
-            results_frame, max_sharpe, min_vol = monte_carlo_optimization(stock_data, num_runs)
+            # monte_carlo_optimization now returns log_returns too
+            results_frame, max_sharpe, min_vol, log_returns = monte_carlo_optimization(stock_data, num_runs)
 
         st.session_state[f'{appId}_results_frame'] = results_frame
+        st.session_state[f'{appId}_log_returns'] = log_returns # Store log returns for custom finder
         st.session_state[f'{appId}_max_sharpe'] = max_sharpe
         st.session_state[f'{appId}_min_vol'] = min_vol
         st.session_state[f'{appId}_target_return'] = target_return
@@ -441,13 +438,15 @@ def page_portfolio_optimizer():
     # --- Display Results ---
     if f'{appId}_optimization_run' in st.session_state and st.session_state[f'{appId}_optimization_run']:
         results_frame = st.session_state[f'{appId}_results_frame']
+        log_returns = st.session_state[f'{appId}_log_returns'] # Retrieve log returns
         max_sharpe = st.session_state[f'{appId}_max_sharpe']
         min_vol = st.session_state[f'{appId}_min_vol']
         target_return = st.session_state[f'{appId}_target_return']
         target_volatility = st.session_state[f'{appId}_target_volatility']
         
         # --- Find Custom Portfolio ---
-        custom_portfolio = find_custom_portfolio(results_frame.copy(), target_return, target_volatility)
+        # Pass log_returns directly to avoid refetching data in the helper function
+        custom_portfolio = find_custom_portfolio(results_frame.copy(), target_return, target_volatility, log_returns)
 
         st.success(f"Simulation Complete! {len(results_frame)} portfolios analyzed.")
         
@@ -465,40 +464,41 @@ def page_portfolio_optimizer():
             labels={'Volatility': 'Annualized Volatility (Risk)', 'Return': 'Annualized Return'}
         )
         
-        # Add Optimal Portfolio markers
+        # Add Optimal Portfolio markers (using different, distinct colors)
+        
         # Max Sharpe (Red Star)
         fig.add_trace(go.Scatter(
             x=[max_sharpe['Volatility']],
             y=[max_sharpe['Return']],
             mode='markers',
-            marker=dict(color='red', size=18, symbol='star', line=dict(width=2, color='white')),
+            marker=dict(color='#E50000', size=18, symbol='star', line=dict(width=2, color='white')),
             name=f'Max Sharpe ({max_sharpe["Sharpe Ratio"]:.2f})'
         ))
 
-        # Min Vol (Blue Circle)
+        # Min Vol (Cyan Circle)
         fig.add_trace(go.Scatter(
             x=[min_vol['Volatility']],
             y=[min_vol['Return']],
             mode='markers',
-            marker=dict(color='blue', size=18, symbol='circle', line=dict(width=2, color='white')),
+            marker=dict(color='#00FFFF', size=18, symbol='circle', line=dict(width=2, color='white')),
             name=f'Min Volatility ({min_vol["Volatility"] * 100:.2f}%)'
         ))
         
-        # Custom Target (Orange Square)
+        # Custom Target (Orange Square) - Represents user's goal
         fig.add_trace(go.Scatter(
             x=[target_volatility],
             y=[target_return],
             mode='markers',
-            marker=dict(color='orange', size=18, symbol='square', line=dict(width=2, color='black')),
+            marker=dict(color='#FF8C00', size=18, symbol='square', line=dict(width=2, color='black')),
             name=f'Your Target ({target_return * 100:.1f}%, {target_volatility * 100:.1f}%)'
         ))
         
-        # Custom Found Portfolio (Purple Diamond)
+        # Custom Found Portfolio (Dark Violet Diamond) - The result closest to the user's goal
         fig.add_trace(go.Scatter(
             x=[custom_portfolio['Volatility']],
             y=[custom_portfolio['Return']],
             mode='markers',
-            marker=dict(color='purple', size=18, symbol='diamond', line=dict(width=2, color='white')),
+            marker=dict(color='#9400D3', size=18, symbol='diamond', line=dict(width=2, color='white')),
             name=f'Custom Portfolio Found'
         ))
 
@@ -522,7 +522,7 @@ def page_portfolio_optimizer():
             col_metric_B.metric("Volatility Achieved", f"{custom_portfolio['Volatility'] * 100:.2f}%", help="Annualized risk level.")
             col_metric_C.metric("Sharpe Ratio", f"{custom_portfolio['Sharpe Ratio']:.2f}", help="Risk-adjusted return (Higher is better).")
 
-            st.markdown("#### Allocation Weights")
+            st.markdown("#### Allocation Weights (How much of each stock to hold)")
             col_weights, col_chart = st.columns(2)
             
             with col_weights:
@@ -534,7 +534,7 @@ def page_portfolio_optimizer():
                     values='Allocation (%)',
                     names='Asset',
                     title='Asset Distribution',
-                    color_discrete_sequence=px.colors.qualitative.T10
+                    color_discrete_sequence=px.colors.qualitative.T10 # Distinct color palette
                 )
                 fig_weights.update_traces(textposition='inside', textinfo='percent+label')
                 fig_weights.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
@@ -542,8 +542,8 @@ def page_portfolio_optimizer():
             
             st.markdown("#### Risk Analysis (95% Confidence)")
             col_var, col_cvar = st.columns(2)
-            col_var.metric("Annual VaR (Value at Risk)", f"{custom_portfolio['VaR (95%)'] * 100:.2f}%")
-            col_cvar.metric("Annual CVaR (Conditional VaR)", f"{custom_portfolio['CVaR (95%)'] * 100:.2f}%")
+            col_var.metric("Annual VaR (Value at Risk)", f"{custom_portfolio['VaR (95%)'] * 100:.2f}%", help="Maximum estimated loss 95% of the time.")
+            col_cvar.metric("Annual CVaR (Conditional VaR)", f"{custom_portfolio['CVaR (95%)'] * 100:.2f}%", help="Average loss in the worst 5% of cases.")
 
 
         # --- Tab 2: Max Sharpe Portfolio ---
@@ -566,7 +566,7 @@ def page_portfolio_optimizer():
                     values='Allocation (%)',
                     names='Asset',
                     title='Asset Distribution',
-                    color_discrete_sequence=px.colors.qualitative.Set2
+                    color_discrete_sequence=px.colors.qualitative.Set2 # Different color palette
                 )
                 fig_weights.update_traces(textposition='inside', textinfo='percent+label')
                 fig_weights.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
@@ -597,7 +597,7 @@ def page_portfolio_optimizer():
                     values='Allocation (%)',
                     names='Asset',
                     title='Asset Distribution',
-                    color_discrete_sequence=px.colors.qualitative.Pastel
+                    color_discrete_sequence=px.colors.qualitative.Pastel # Different color palette
                 )
                 fig_weights.update_traces(textposition='inside', textinfo='percent+label')
                 fig_weights.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
